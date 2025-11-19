@@ -1,0 +1,7 @@
+eval.ipynb
+test.ipynb
+.trash
+wandb
+output*
+__pycache__
+data

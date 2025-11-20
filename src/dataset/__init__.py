@@ -39,6 +39,8 @@ def init_dataset(dataset_name: str, split: str = "train", context_length: int = 
     elif dataset_name == "biosignal":
         dataset_pathes = list(Path(BIOSIGNAL_DATASET).glob("*"))
         dataset_pathes = [path for path in dataset_pathes if "sub1_" in path.name]
+        # dataset_pathes = [path for path in dataset_pathes if 20 <= int(path.name.split("_trial")[-1].split(".")[0]) <= 40]
+
         datasets = []
 
         for dataset_path in tqdm(dataset_pathes):
@@ -53,7 +55,7 @@ def init_dataset(dataset_name: str, split: str = "train", context_length: int = 
                 x_standardization=True,
                 y_standardization=True,
                 patch_validate_fns=BIOSIGNAL_DEFAULT_PATCH_VALIDATE_FNS,
-                skip_validate=True,
+                # skip_validate=True,
                 verbose=False,
                 patch_report_fn=BIOSIGNAL_DEFAULT_REPORT_FN,
                 train_ratio=0.8,
@@ -71,13 +73,6 @@ def init_dataset(dataset_name: str, split: str = "train", context_length: int = 
     return dataset
 
 
-def collate_fn(batch):
-    batch_dict = {}
-    for key in batch[0].keys():
-        batch_dict[key] = torch.stack([item[key] for item in batch], dim=0)
-    return batch_dict
-
 __all__ = [
     "init_dataset",
 ]
-

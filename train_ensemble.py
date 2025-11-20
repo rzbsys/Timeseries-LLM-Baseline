@@ -14,29 +14,32 @@ from src.model import BTSModel
 from src.dataset import init_dataset
 from src.utils import to_device, set_seed
 
+import sys
+
 import warnings
 
 warnings.filterwarnings(
     "ignore", "None of the inputs have requires_grad=True. Gradients will be None"
 )
 
+dataset = sys.argv[1]
 
 DATASET = "biosignal"  # "manufacturing" or "biosignal"
 
 WANDB_MODE = "online"
 TEST_NAME = f"{DATASET}_ensemble_experiment"
-LLAMA_MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
-MOMENT_MODEL_NAME = "AutonLab/MOMENT-1-large"
+LLAMA_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
+MOMENT_MODEL_NAME = "AutonLab/MOMENT-1-small"
 DEVICE = "cuda"
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 DATALOADER_SHUFFLE = True
-LEARNING_RATE = 1e-6
+LEARNING_RATE = 1e-4
 EPOCHS = 10
 MAX_GRAD_NORM = 5.0
 OUTPUT_DIR = f"./outputs/{TEST_NAME}"
 CONTEXT_LENGTH = 12
 STRIDE = 12 if DATASET == "biosignal" else 1
-ACCUMULATE_STEPS = 4
+ACCUMULATE_STEPS = 1
 NUM_CHANNELS = 19 if DATASET == "biosignal" else 24
 
 task_name = "classification" if DATASET == "biosignal" else "forecasting"
@@ -59,18 +62,19 @@ def train_model(model, dataloader, optimizer, loss_fn, task_name, scheduler, sca
                 moment_outputs = moment_outputs.logits
                 # B, 2
                 targets = batch["y"].long().squeeze(-1)
-                outputs = llama_outputs + moment_outputs
             elif task_name == "forecasting":
                 # B, 1
                 moment_outputs = moment_outputs.forecast[:, -1]
                 targets = batch["y_scaled"].float()
-                outputs = (llama_outputs + moment_outputs) / 2
+            
+            alpha = model.get_fusion_ratio()
+            outputs = (alpha * llama_outputs) + ((1 - alpha) * moment_outputs)
             loss = loss_fn(outputs, targets)
             accumulate_losses += loss
             accumulate_steps += 1
             with torch.no_grad():
-                accumulate_llama_losses += loss_fn(moment_outputs, targets)
-                accumulate_moment_losses += loss_fn(llama_outputs, targets)
+                accumulate_llama_losses += loss_fn(llama_outputs, targets)
+                accumulate_moment_losses += loss_fn(moment_outputs, targets)
 
         if i % ACCUMULATE_STEPS == 0 or i == len(dataloader) - 1:
             accumulate_losses = accumulate_losses / accumulate_steps
@@ -79,9 +83,7 @@ def train_model(model, dataloader, optimizer, loss_fn, task_name, scheduler, sca
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            parameters = list(model.llama_head.parameters()) + list(
-                model.moment_model.head.parameters()
-            )
+            parameters = [p for p in model.parameters() if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(parameters, MAX_GRAD_NORM)
             scaler.step(optimizer)
             scheduler.step()
@@ -93,7 +95,8 @@ def train_model(model, dataloader, optimizer, loss_fn, task_name, scheduler, sca
                     "train/total_loss": accumulate_losses.item(),
                     "train/llama_loss": accumulate_llama_losses.item(),
                     "train/moment_loss": accumulate_moment_losses.item(),
-                    "moment_lr": scheduler.get_last_lr()[0],
+                    "lr": scheduler.get_last_lr()[0],
+                    "train/fusion_alpha(llama_weight)": model.get_fusion_ratio().item(),
                 },
             )
             accumulate_losses = 0.0
@@ -115,23 +118,21 @@ def eval_model(model, dataloader, loss_fn, task_name):
             moment_outputs = model.forward_moment(timeseries=batch["x_scaled"])
             if task_name == "classification":
                 targets = batch["y"].long().squeeze(-1)
-
+                moment_outputs = moment_outputs.logits
                 llama_loss = loss_fn(llama_outputs, targets)
-                moment_loss = loss_fn(moment_outputs.logits, targets)
-                logits = (llama_outputs + moment_outputs.logits) / 2
-                loss = loss_fn(logits, targets)
-
+                moment_loss = loss_fn(moment_outputs, targets)
             elif task_name == "forecasting":
                 targets_scaled = batch["y_scaled"].float()
 
                 llama_pred = llama_outputs
                 llama_loss = loss_fn(llama_pred, targets_scaled)
 
-                moment_pred = moment_outputs.forecast[:, -1]
-                moment_loss = loss_fn(moment_pred, targets_scaled)
+                moment_outputs = moment_outputs.forecast[:, -1]
+                moment_loss = loss_fn(moment_outputs, targets_scaled)
 
-                pred = (moment_pred + llama_pred) / 2
-                loss = loss_fn(pred, targets_scaled)
+            alpha = model.get_fusion_ratio()
+            pred = (alpha * llama_outputs) + ((1 - alpha) * moment_outputs)
+            loss = loss_fn(pred, targets_scaled)
         total_losses.append(loss.item())
         moment_losses.append(moment_loss.item())
         llama_losses.append(llama_loss.item())
@@ -140,6 +141,7 @@ def eval_model(model, dataloader, loss_fn, task_name):
             "eval/softvote_loss": sum(total_losses) / len(total_losses),
             "eval/moment_loss": sum(moment_losses) / len(moment_losses),
             "eval/llama_loss": sum(llama_losses) / len(llama_losses),
+            "eval/fusion_alpha(llama_weight)": model.get_fusion_ratio().item(),
         }
     )
 
@@ -190,6 +192,7 @@ def main():
         shuffle=DATALOADER_SHUFFLE,
         prefetch_factor=3,
         num_workers=1,
+        pin_memory=True,
     )
     test_dataloader = DataLoader(
         test_dataset,
@@ -197,6 +200,7 @@ def main():
         shuffle=DATALOADER_SHUFFLE,
         prefetch_factor=3,
         num_workers=1,
+        pin_memory=True,
     )
     model = BTSModel(
         llama_model_name=LLAMA_MODEL_NAME,
@@ -211,27 +215,30 @@ def main():
 
     loss_fn = None
     if task_name == "classification":
-        loss_fn = nn.CrossEntropyLoss()
+        loss_fn = nn.CrossEntropyLoss().to(DEVICE)
     elif task_name == "forecasting":
-        loss_fn = nn.MSELoss()
+        loss_fn = nn.MSELoss().to(DEVICE)
     else:
         raise ValueError("Unsupported task name")
 
     steps_per_epoch = math.ceil(len(train_dataloader) / ACCUMULATE_STEPS)
     total_steps = steps_per_epoch * EPOCHS
 
-    model_parameters = list(model.llama_head.parameters()) + list(
-        model.moment_model.head.parameters()
-    )
-    optimizer = torch.optim.Adam(model_parameters, lr=LEARNING_RATE)
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), 
+        lr=LEARNING_RATE
+    )    
+    max_lr = 1e-4
+    total_steps = math.ceil(len(train_dataloader) / ACCUMULATE_STEPS) * EPOCHS
+    scheduler = OneCycleLR(optimizer, max_lr=max_lr, total_steps=total_steps, pct_start=0.3)
 
-    scheduler = get_scheduler(
-        # name='constant_with_warmup',
-        name="linear",
-        optimizer=optimizer,
-        num_training_steps=total_steps,
-        num_warmup_steps=steps_per_epoch,
-    )
+    # scheduler = get_scheduler(
+    #     # name='constant_with_warmup',
+    #     name="linear",
+    #     optimizer=optimizer,
+    #     num_training_steps=total_steps,
+    #     num_warmup_steps=steps_per_epoch,
+    # )
 
     for epoch in range(EPOCHS):
         wandb.log({"epoch": epoch + 1})

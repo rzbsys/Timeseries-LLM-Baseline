@@ -19,7 +19,7 @@ import warnings
 warnings.filterwarnings("ignore", "None of the inputs have requires_grad=True. Gradients will be None")
 
 
-DATASET = "biosignal"  # "manufacturing" or "biosignal"
+DATASET = "manufacturing"  # "manufacturing" or "biosignal"
 
 WANDB_MODE = "online"
 TEST_NAME = f"{DATASET}"
@@ -41,7 +41,7 @@ MOMENT_ACCUMULATE_STEPS = 2
 task_name = "classification" if DATASET == "biosignal" else "forecasting"
 
 
-def train_llama_model(model, dataloader, optimizer, loss_fn, task_name, scheduler, scaler):
+def train_llama_model(model, dataloader, optimizer, loss_fn, task_name, scheduler, scaler, start_logging_steps):
     model.train()
     losses = []
     accumulate_losses = 0.0
@@ -69,16 +69,18 @@ def train_llama_model(model, dataloader, optimizer, loss_fn, task_name, schedule
             losses.append(accumulate_losses.item())
             wandb.log(
                 {
-                    "train_llama_loss": accumulate_losses.item(),
+                    "train/llama_loss": accumulate_losses.item(),
                     "llama_lr": scheduler.get_last_lr()[0],
-                }
+                },
+                step=start_logging_steps,
             )
+            start_logging_steps += 1
             accumulate_losses = 0.0
             accumulate_steps = 0
     return sum(losses) / len(losses)
 
 
-def train_moment_model(model, dataloader, optimizer, loss_fn, task_name, scheduler, scaler):
+def train_moment_model(model, dataloader, optimizer, loss_fn, task_name, scheduler, scaler, start_logging_steps):
     model.train()
     losses = []
     accumulate_losses = 0.0
@@ -108,10 +110,12 @@ def train_moment_model(model, dataloader, optimizer, loss_fn, task_name, schedul
             losses.append(accumulate_losses.item())
             wandb.log(
                 {
-                    "train_moment_loss": accumulate_losses.item(),
+                    "train/moment_loss": accumulate_losses.item(),
                     "moment_lr": scheduler.get_last_lr()[0],
-                }
+                },
+                steps=start_logging_steps,
             )
+            start_logging_steps += 1
             accumulate_losses = 0.0
             accumulate_steps = 0
     return sum(losses) / len(losses)
@@ -159,9 +163,9 @@ def eval_model(model, dataloader, loss_fn, task_name):
         llama_losses.append(llama_loss.item())
     wandb.log(
         {
-            "eval_softvote_loss": sum(softvote_losses) / len(softvote_losses),
-            "eval_moment_loss": sum(moment_losses) / len(moment_losses),
-            "eval_llama_loss": sum(llama_losses) / len(llama_losses),
+            "eval/softvote_loss": sum(softvote_losses) / len(softvote_losses),
+            "eval/moment_loss": sum(moment_losses) / len(moment_losses),
+            "eval/llama_loss": sum(llama_losses) / len(llama_losses),
         }
     )
     return sum(softvote_losses) / len(softvote_losses)
@@ -259,6 +263,8 @@ def main():
     for epoch in range(EPOCHS):
         wandb.log({"epoch": epoch + 1})
         print(f"Epoch {epoch + 1}/{EPOCHS} - Training Llama Model")
+        llama_start_step = math.ceil(len(train_dataloader) / LLAMA_ACCUMULATE_STEPS) * epoch
+
         train_llama_model(
             model=model,
             dataloader=train_dataloader,
@@ -267,8 +273,10 @@ def main():
             task_name=task_name,
             scaler=scaler,
             scheduler=llama_scheduler,
+            start_logging_steps=llama_start_step,
         )
 
+        moment_start_step = math.ceil(len(train_dataloader) / MOMENT_ACCUMULATE_STEPS) * epoch
         print(f"Epoch {epoch + 1}/{EPOCHS} - Training Moment Model")
         train_moment_model(
             model=model,
@@ -278,6 +286,7 @@ def main():
             task_name=task_name,
             scaler=scaler,
             scheduler=moment_scheduler,
+            start_logging_steps=moment_start_step,
         )
         wandb.log({"moment_lr": moment_scheduler.get_last_lr()[0]})
 

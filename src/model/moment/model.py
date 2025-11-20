@@ -84,7 +84,6 @@ class ForecastingHead(nn.Module):
         self.linear = nn.Linear(head_nf, forecast_horizon)
 
     def forward(self, x, input_mask: torch.Tensor = None):
-        print(self.linear.weight.grad)
         x = self.flatten(x)
         x = self.linear(x)
         x = self.dropout(x)

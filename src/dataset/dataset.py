@@ -31,8 +31,8 @@ class DatasetConfig:
     patch_validate_fns: List[Callable] = None
     skip_validate: bool = False
     verbose: bool = True
-    patch_report_fn: Callable = None 
-    shuffle : bool = True
+    patch_report_fn: Callable = None
+    shuffle: bool = True
     seed: int = 42
     load_dataset: bool = True
 
@@ -84,6 +84,8 @@ class BTSTimeSeriesDataset(Dataset):
                 stride=self.config.stride,
                 validate_fns=self.config.patch_validate_fns,
                 verbose=self.config.verbose,
+                y_horizon=self.config.y_horizon,
+                y_offset=self.config.y_offset,
             )
         else:
             max_valid_indicate = len(preprocess_data) - self.config.context_length + 1 - self.config.y_offset - self.config.y_horizon + 1
@@ -111,7 +113,7 @@ class BTSTimeSeriesDataset(Dataset):
             self.scaled_dataset = preprocess_data[list(cols)]
         else:
             self.scaled_dataset = None
-            
+
         # 데이터셋 선택 부분
         if self.config.mode == "train":
             self.indicates = train_data
@@ -119,7 +121,6 @@ class BTSTimeSeriesDataset(Dataset):
             self.indicates = val_data
         else:
             self.indicates = test_data
-
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         x_indicates = self.indicates[idx]
@@ -136,6 +137,7 @@ class BTSTimeSeriesDataset(Dataset):
 
         x = torch.tensor(self.dataset.iloc[x_indicates][self.config.column_to_train].values).T.float()
         y = torch.tensor(self.dataset.iloc[y_indicates][self.config.column_to_predict].values).T.float()
+
         output = {"x": x, "y": y, "x_columns": self.config.column_to_train, "y_column": self.config.column_to_predict}
 
         if self.config.x_standardization:
@@ -166,6 +168,7 @@ class BTSTimeSeriesDataset(Dataset):
         new_dataset.scaler_y = self.scaler_y
         new_dataset.__valid_indices = self.__valid_indices
         return new_dataset
+
 
 class ConcatDataets(Dataset):
     def __init__(self, datasets: List[Dataset]):

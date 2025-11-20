@@ -40,11 +40,13 @@ Output format:
 class BTSModel(nn.Module):
     def __init__(
         self,
+        num_channels: Optional[int] = None,
         llama_model_name: Optional[str] = LLM_BASE_MODEL_NAME,
         moment_model_name: Optional[str] = TIMESERIES_BASE_MODEL_NAME,
         device: Optional[torch.device] = None,
         task_name: Literal["classification", "forecasting"] = "classification",
         moment_reduction_method: Literal["mean", "concat"] = "concat",
+
     ):
         super().__init__()
         self.llama_enabled = llama_model_name is not None
@@ -65,6 +67,7 @@ class BTSModel(nn.Module):
             self.moment_model, _ = self.init_moment(
                 moment_model_name,
                 task_name=self.task_name,
+                num_channels=num_channels,
             )
             self.moment_model.to(self.device)
 
@@ -77,12 +80,10 @@ class BTSModel(nn.Module):
         if task_name == "classification":
             llama_head = nn.Sequential(
                 nn.Linear(llama_model.config.hidden_size, llama_model.config.hidden_size),
-                nn.Linear(llama_model.config.hidden_size, llama_model.config.hidden_size),
                 nn.Linear(llama_model.config.hidden_size, 2)
             )
         elif task_name == "forecasting":
             llama_head = nn.Sequential(
-                nn.Linear(llama_model.config.hidden_size, llama_model.config.hidden_size),
                 nn.Linear(llama_model.config.hidden_size, llama_model.config.hidden_size),
                 nn.Linear(llama_model.config.hidden_size, 1)
             )
@@ -94,6 +95,7 @@ class BTSModel(nn.Module):
     def init_moment(
         moment_model_name: str,
         task_name: Literal["classification", "forecasting"] = "classification",
+        num_channels: Optional[int] = None,
     ) -> Tuple[MOMENTPipeline, None]:
         config = {
             "task_name": task_name,
@@ -103,9 +105,12 @@ class BTSModel(nn.Module):
         }
         if task_name == "classification":
             config["num_class"] = 2
-            config["n_channels"] = 1
+            if num_channels is not None:
+                config["n_channels"] = num_channels
         elif task_name == "forecasting":
             config["forecast_horizon"] = 1
+            config['head_dropout'] = 0.1
+            config['weight_decay'] = 0
 
         moment_model = MOMENTPipeline.from_pretrained(
             moment_model_name,
@@ -150,6 +155,7 @@ class BTSModel(nn.Module):
         input_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.bool, device=timeseries.device)
         if pad > 0:
             input_mask[:, pad:] = 1
+        
         moment_outputs = self.moment_model(
             x_enc=timeseries,
             reduction=self.moment_reduction_method,

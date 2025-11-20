@@ -42,11 +42,15 @@ def calc_valid_indices(
     dataset: pd.DataFrame,
     context_length: int,
     stride: int,
+    y_horizon: int,
+    y_offset: int,
     validate_fns: List[Callable],
     parallel: bool = False,
     verbose: bool = True,
 ) -> list[list[int]]:
-    start_idx = np.arange(0, len(dataset) - context_length + 1, stride, dtype=np.int64)
+
+    max_idx = len(dataset) - context_length - y_offset - y_horizon + 1
+    start_idx = np.arange(0, max_idx, stride, dtype=np.int64)
     valid_indices = []
     skip_cnt = 0
 

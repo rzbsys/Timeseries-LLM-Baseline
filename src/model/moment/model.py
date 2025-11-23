@@ -10,7 +10,6 @@ from torch import nn
 from transformers import T5Config, T5EncoderModel, T5Model
 
 from momentfm.common import TASKS
-from momentfm.data.base import TimeseriesOutputs
 from momentfm.models.layers.embed import PatchEmbedding, Patching
 from momentfm.models.layers.revin import RevIN
 from momentfm.utils.masking import Masking
@@ -19,6 +18,24 @@ from momentfm.utils.utils import (
     get_anomaly_criterion,
     get_huggingface_model_dimensions,
 )
+from dataclasses import dataclass
+import numpy.typing as npt
+
+
+@dataclass
+class TimeseriesOutputs:
+    forecast: npt.NDArray = None
+    hidden_states: npt.NDArray = None
+    anomaly_scores: npt.NDArray = None
+    logits: npt.NDArray = None
+    labels: int = None
+    input_mask: npt.NDArray = None
+    pretrain_mask: npt.NDArray = None
+    reconstruction: npt.NDArray = None
+    embeddings: npt.NDArray = None
+    metadata: dict = None
+    illegal_output: bool = False
+
 
 SUPPORTED_HUGGINGFACE_MODELS = [
     "google/flan-t5-small",
@@ -406,11 +423,19 @@ class MOMENT(nn.Module):
         enc_out = outputs.last_hidden_state
         enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
         # [batch_size x n_channels x n_patches x d_model]
+        
+        
+        # ADD: for concat and pred
+        enc_out_ = enc_out.mean(dim=1, keepdim=False)  # Mean across channels
+        input_mask_patch_view = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
+        input_mask_patch_view = input_mask_patch_view.unsqueeze(-1).repeat(1, 1, self.config.d_model)
+        enc_out_ = (input_mask_patch_view * enc_out_).sum(dim=1) / input_mask_patch_view.sum(dim=1)
+
 
         dec_out = self.head(enc_out)  # [batch_size x n_channels x forecast_horizon]
         dec_out = self.normalizer(x=dec_out, mode="denorm")
 
-        return TimeseriesOutputs(input_mask=input_mask, forecast=dec_out)
+        return TimeseriesOutputs(input_mask=input_mask, forecast=dec_out, hidden_states=enc_out_)
 
     def short_forecast(
         self,
@@ -495,6 +520,14 @@ class MOMENT(nn.Module):
         enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
         # [batch_size x n_channels x n_patches x d_model]
 
+
+        # ADD: for concat and pred
+        enc_out_ = enc_out.mean(dim=1, keepdim=False)  # Mean across channels
+        input_mask_patch_view = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
+        input_mask_patch_view = input_mask_patch_view.unsqueeze(-1).repeat(1, 1, self.config.d_model)
+        enc_out_ = (input_mask_patch_view * enc_out_).sum(dim=1) / input_mask_patch_view.sum(dim=1)
+
+
         # Mean across channels
         if reduction == "mean":
             # [batch_size x n_patches x d_model]
@@ -507,9 +540,11 @@ class MOMENT(nn.Module):
         else:
             raise NotImplementedError(f"Reduction method {reduction} not implemented.")
 
+
+
         logits = self.head(enc_out, input_mask=input_mask)
 
-        return TimeseriesOutputs(embeddings=enc_out, logits=logits, metadata=reduction)
+        return TimeseriesOutputs(embeddings=enc_out, logits=logits, metadata=reduction, hidden_states=enc_out_)
 
     def forward(
         self,

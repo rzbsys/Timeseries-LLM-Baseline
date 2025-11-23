@@ -7,7 +7,17 @@ from torch.utils.data import Dataset
 import pandas as pd
 from dataclasses import dataclass
 import random
+
 from src.dataset.utils import *
+from src.model.llama.utils import tokenize, create_data_format
+
+GENERATE_RESULT_PROMPT = """You are an expert time-series prediction system.
+Your input is a natural-language report describing one or more time series.
+Identify and leverage column (feature) details and inter-column relationships mentioned in the report to interpret patterns (trend, seasonality, anomalies, missing data, etc.), then produce a binary prediction based on the report's evidence.
+
+1. Extract time granularity, key variables, units, aggregation rules, baselines/thresholds from the report.
+2. If causal/correlational relationships between columns are described, use them as evidence.
+3. Analyze this report and summarize the features for prediction."""
 
 
 @dataclass
@@ -35,6 +45,8 @@ class DatasetConfig:
     shuffle: bool = True
     seed: int = 42
     load_dataset: bool = True
+    generate_system_prompt: str = GENERATE_RESULT_PROMPT
+    random_sigma: float = 0.0
 
     def __post_init__(self):
         assert self.mode in ["train", "val", "test"], "Mode must be 'train', 'val', or 'test'."
@@ -99,8 +111,9 @@ class BTSTimeSeriesDataset(Dataset):
         train_index = [idx for indices in train_data for idx in indices]
         if self.config.x_standardization:
             # 우선 train data에 fit 시켜야해서 분할 먼저
-            train_x = preprocess_data.iloc[train_index][self.config.column_to_train].values
-            preprocess_data, scaler_x = standardize_data(preprocess_data, train_x, self.config.column_to_train)
+            column_to_train_wo_target = [col for col in self.config.column_to_train if col != self.config.column_to_predict]
+            train_x = preprocess_data.iloc[train_index][column_to_train_wo_target].values
+            preprocess_data, scaler_x = standardize_data(preprocess_data, train_x, column_to_train_wo_target)
             self.scaler_x = scaler_x
 
         if self.config.y_standardization:
@@ -130,44 +143,62 @@ class BTSTimeSeriesDataset(Dataset):
 
         y_indicates = list(range(y_min, y_max))
 
-        patch_report = None
-        if self.config.patch_report_fn is not None:
-            sliced_data = self.dataset.iloc[x_indicates]
-            patch_report = self.config.patch_report_fn(sliced_data)
-
         x = torch.tensor(self.dataset.iloc[x_indicates][self.config.column_to_train].values).T.float()
         y = torch.tensor(self.dataset.iloc[y_indicates][self.config.column_to_predict].values).T.float()
 
+        if self.config.random_sigma > 0.0:
+            random_noise = torch.randn_like(x) * self.config.random_sigma
+            x += random_noise
+
         output = {"x": x, "y": y, "x_columns": self.config.column_to_train, "y_column": self.config.column_to_predict}
 
+        patch_report = None
+        if self.config.patch_report_fn is not None:
+            sliced_data = self.dataset.iloc[x_indicates].copy()
+            if self.config.random_sigma > 0.0:
+                sliced_data = torch.tensor(sliced_data[self.config.column_to_train].values).T.float() + random_noise
+                sliced_data = pd.DataFrame(sliced_data.T.numpy(), columns=self.config.column_to_train)
+            patch_report = self.config.patch_report_fn(sliced_data)
+            output["patch_report"] = patch_report
         if self.config.x_standardization:
             x_s = torch.tensor(self.scaled_dataset.iloc[x_indicates][self.config.column_to_train].values).T.float()
+            if self.config.random_sigma > 0.0:
+                x_s += random_noise
             output["x_scaled"] = x_s
         if self.config.y_standardization:
             y_s = torch.tensor(self.scaled_dataset.iloc[y_indicates][self.config.column_to_predict].values).T.float()
 
             output["y_scaled"] = y_s
-        if patch_report is not None:
-            output["patch_report"] = patch_report
-
         return output
 
     def __len__(self) -> int:
         return len(self.indicates)
 
-    def copy(self, mode: Literal["train", "val", "test"]) -> "BTSTimeSeriesDataset":
-        assert mode in ["train", "val", "test"], "Mode must be 'train', 'val', or 'test'."
-        new_config = self.config
-        new_config.mode = mode
-        new_config.load_dataset = False
-        new_dataset = BTSTimeSeriesDataset(new_config)
-        new_dataset.origin_data = self.origin_data
-        new_dataset.dataset = self.dataset
-        new_dataset.scaled_dataset = self.scaled_dataset
-        new_dataset.scaler_x = self.scaler_x
-        new_dataset.scaler_y = self.scaler_y
-        new_dataset.__valid_indices = self.__valid_indices
-        return new_dataset
+
+def collate_fn(tokenizer, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    collated = {}
+    for key in batch[0].keys():
+        if isinstance(batch[0][key], torch.Tensor):
+            collated[key] = torch.stack([item[key] for item in batch], dim=0)
+        else:
+            collated[key] = [item[key] for item in batch]
+
+    if "patch_report" in collated:
+        messages = [
+            create_data_format(
+                [GENERATE_RESULT_PROMPT, report],
+                roles=["system", "user"],
+            )
+            for report in collated["patch_report"]
+        ]
+
+        patch_report_tokenized = tokenize(
+            tokenizer,
+            messages,
+            add_generation_prompt=True,
+        )
+        collated["patch_report_tokenized"] = dict(patch_report_tokenized)
+    return collated
 
 
 class ConcatDataets(Dataset):

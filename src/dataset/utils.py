@@ -80,22 +80,3 @@ def calc_valid_indices(
     if verbose:
         print(f"Skipped {skip_cnt} sequences due to validation functions.")
     return valid_indices
-
-
-def create_data_format(messages: List[str], roles: List[str]):
-    assert len(messages) == len(roles), "Messages and roles must have the same length."
-    data = []
-    for msg, role in zip(messages, roles):
-        data.append({"role": role, "content": msg})
-    return data
-
-
-def tokenize(tokenizer: Any, texts: List[str], max_length: int) -> dict[str, Any]:
-
-    return tokenizer(
-        texts,
-        max_length=max_length,
-        padding="max_length",
-        truncation=True,
-        return_tensors="pt",
-    )

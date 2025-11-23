@@ -1,6 +1,7 @@
 import pandas as pd
 from datetime import timedelta
 
+
 SAMYANG_DEFAULT_TRAIN_COLUMNS = [
     # Stage1
     *[
@@ -73,10 +74,9 @@ SAMYANG_DEFAULT_PATCH_VALIDATE_FNS = [
 ]
 
 
-
 from data.manufacturing.generate_patch import generate_patch_report as generate_samyang_report
-SAMYANG_DEFAULT_REPORT_FN = generate_samyang_report
 
+SAMYANG_DEFAULT_REPORT_FN = generate_samyang_report
 
 
 # EEG 데이터
@@ -117,4 +117,5 @@ BIOSIGNAL_DEFAULT_PATCH_VALIDATE_FNS = [
 
 
 from data.biosignal.generate_patch import generate_patch_report as generate_biosignal_report
+
 BIOSIGNAL_DEFAULT_REPORT_FN = generate_biosignal_report

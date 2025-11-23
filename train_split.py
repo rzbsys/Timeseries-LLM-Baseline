@@ -1,3 +1,5 @@
+# TODO: train_ensemble.py와 비교해서 불필요한 부분 제거하고 이후 변경사항을 반영해야함.
+
 from tqdm import tqdm
 from pathlib import Path
 import math

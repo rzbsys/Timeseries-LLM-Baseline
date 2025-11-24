@@ -11,9 +11,9 @@ from src.dataset import init_dataset, collate_fn
 from src.utils import to_device, set_seed
 
 
-DATASET = "biosignal"  # "manufacturing" or "biosignal"
-# CHECKPOINT_PATH = "./outputs.old/manufacturing_ensemble_experiment.overfit/epoch_3"
-CHECKPOINT_PATH = "./outputs.old/biosignal_ensemble_experiment/epoch_1"
+DATASET = "manufacturing"  # "manufacturing" or "biosignal"
+CHECKPOINT_PATH = "./outputs.old/manufacturing_ensemble_experiment.overfit/epoch_3"
+# CHECKPOINT_PATH = "./outputs.old/biosignal_ensemble_experiment/epoch_1"
 OUTPUT_DIR = f"./outputs/eval_{DATASET}_ensemble1"
 LLAMA_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 MOMENT_MODEL_NAME = "AutonLab/MOMENT-1-small"
@@ -99,7 +99,7 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     sigmas = [0.0, 0.05, 0.1, 1, 3, 5]
-    reversed(sigmas)
+    # reverse
     results = []
     for sigma in sigmas:
         print(f"Evaluating with random sigma: {sigma}")

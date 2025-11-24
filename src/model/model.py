@@ -7,16 +7,9 @@ import torch.nn as nn
 from transformers import AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel, PeftConfig, get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 
-from src.model.llama import (
-    LlamaModel,
-    create_data_format,
-    tokenize,
-)
-from src.model.moment import MOMENTPipeline, TimeseriesOutputs
-from src.utils import freeze_parameters, unfreeze_parameters
-
-LLM_BASE_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
-TIMESERIES_BASE_MODEL_NAME = "AutonLab/MOMENT-1-large"
+from src.model.llama import LlamaModel
+from src.model.moment import MOMENTPipeline
+from src.utils import freeze_parameters
 
 
 @dataclass
@@ -29,90 +22,30 @@ class MomentOutputs:
     last_hidden_state: torch.Tensor = None
 
 
-class CombineHead(nn.Module):
-    def __init__(self, llama_input_dim: int, moment_input_dim: int, n_classes: int):
-        super().__init__()
-        self.llama_fusion_net = nn.Linear(llama_input_dim, 128)
-        self.moment_fusion_net = nn.Linear(moment_input_dim, 128)
-        self.combine_nn = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, n_classes),
-        )
-
-    def forward(self, llama_outputs: LlamaOutputs, moment_outputs: MomentOutputs) -> torch.Tensor:
-        llama_feat = self.llama_fusion_net(llama_outputs.last_hidden_state)
-        moment_feat = self.moment_fusion_net(moment_outputs.last_hidden_state)
-        combined_feat = torch.cat([llama_feat, moment_feat], dim=-1)
-        return self.combine_nn(combined_feat)
-
-
-class BTSModel(nn.Module):
-    def __init__(
-        self,
-        num_channels: Optional[int] = None,
-        llama_model_name: Optional[str] = LLM_BASE_MODEL_NAME,
-        moment_model_name: Optional[str] = TIMESERIES_BASE_MODEL_NAME,
-        device: Optional[torch.device] = None,
-        task_name: Literal["classification", "forecasting"] = "classification",
-        moment_reduction_method: Literal["mean", "concat"] = "concat",
-    ):
-        super().__init__()
-        self.llama_enabled = llama_model_name is not None
-        self.moment_enabled = moment_model_name is not None
-        self.device = device if device is not None else torch.device("cpu")
-        self.task_name = task_name
-        self.moment_reduction_method = moment_reduction_method
-
-        # Llama Model
-        if self.llama_enabled:
-            self.llama_model, _ = self.init_llama(llama_model_name)
-            self.llama_model.to(self.device)
-        # Moment Model
-        if self.moment_enabled:
-            self.moment_model, _ = self.init_moment(
-                moment_model_name,
-                task_name=self.task_name,
-                num_channels=num_channels,
-            )
-            self.moment_model.to(self.device)
-
-        # for combine
-        # self.fusion_weight = nn.Parameter(torch.tensor(0.0))
-        n_classes = 2 if task_name == "classification" else 1
-
-        self.combind_head = CombineHead(
-            llama_input_dim=self.llama_model.config.hidden_size,
-            moment_input_dim=self.moment_model.config.d_model,
-            n_classes=n_classes,
-        ).to(self.device)
-
-    @staticmethod
-    def init_llama(
-        llama_model_name: str,
-        # task_name: Literal["classification", "forecasting"] = "classification",
-    ) -> Tuple[LlamaModel, Optional[nn.Linear]]:
+def init_llama(llama_model_name: str, quantization: bool = False, model_compile: bool = False, init_lora: bool = False) -> LlamaModel:
+    model_config = {
+        # "attn_implementation": "flash_attention_2",
+        "torch_dtype": torch.bfloat16,
+    }
+    if quantization:
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
+        model_config["quantization_config"] = bnb_config
 
-        llama_model = LlamaModel.from_pretrained(
-            llama_model_name,
-            # attn_implementation="flash_attention_2",
-            torch_dtype=torch.bfloat16,
-            quantization_config=bnb_config,
-        )
+    llama_model = LlamaModel.from_pretrained(llama_model_name, **bnb_config)
+    if model_compile:
         llama_model = torch.compile(llama_model, mode="max-autotune")
-
-        # Lora
+    # Lora
+    if init_lora:
         peft_config = LoraConfig(
             inference_mode=False,
-            lora_alpha=16,  # LoRA 스케일링 팩터
-            lora_dropout=0.1,  # LoRA 드롭아웃 비율
-            r=64,  # LoRA 랭크
+            lora_alpha=16,
+            lora_dropout=0.1,
+            r=64,
             bias="none",
             task_type=TaskType.FEATURE_EXTRACTION,
             # target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
@@ -120,52 +53,130 @@ class BTSModel(nn.Module):
         )
         llama_model = prepare_model_for_kbit_training(llama_model)
         llama_model = get_peft_model(llama_model, peft_config)
+    else:
         freeze_parameters(llama_model)
-        return llama_model, None
+    return llama_model
 
-    @staticmethod
-    def init_moment(
-        moment_model_name: str,
-        task_name: Literal["classification", "forecasting"] = "classification",
-        num_channels: Optional[int] = None,
-    ) -> Tuple[MOMENTPipeline, None]:
-        config = {
-            "task_name": task_name,
-            "freeze_embedder": True,
-            "freeze_encoder": True,
-            "freeze_head": False,
-        }
-        if task_name == "classification":
-            config["num_class"] = 2
-            if num_channels is not None:
-                config["n_channels"] = num_channels
-        elif task_name == "forecasting":
-            config["forecast_horizon"] = 1
-            config["head_dropout"] = 0.1
-            config["weight_decay"] = 0
 
-        moment_model = MOMENTPipeline.from_pretrained(
-            moment_model_name,
-            model_kwargs=config,
+def init_moment(moment_model_name: str) -> MOMENTPipeline:
+    config = {"task_name": "embedding"}
+
+    moment_model = MOMENTPipeline.from_pretrained(
+        moment_model_name,
+        model_kwargs=config,
+    )
+    moment_model.init()
+    return moment_model
+
+
+class TRMModule(nn.Module):
+    def __init__(
+        self,
+        n_classes: int,
+        llama_output_dim: int,
+        moment_output_dim: int,
+        trm_dim: int = 512,
+        n_recursion: int = 6,
+    ):
+        super().__init__()
+        self.trm_dim = trm_dim
+        self.n_recursion = n_recursion
+        self.n_classes = n_classes
+        self.z_init = nn.Parameter(torch.randn(1, 1, trm_dim))
+
+        self.decoder_layer = nn.TransformerDecoderLayer(
+            d_model=trm_dim,
+            nhead=8,
+            dim_feedforward=2048,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )  # Pre-Norm for stability
+        self.llama_proj = nn.Linear(llama_output_dim, trm_dim)
+        self.moment_proj = nn.Linear(moment_output_dim, trm_dim)
+
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(trm_dim),
+            nn.Linear(
+                trm_dim,
+                n_classes,
+            ),
         )
-        moment_model.init()
-        unfreeze_parameters(moment_model.head)
-        return moment_model, None
+
+    def forward_recursion_step(self, z: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        new_z = self.decoder_layer(z, context)
+        return new_z
+
+    def forward(self, llama_emb: torch.Tensor, moment_emb: torch.Tensor) -> torch.Tensor:
+        llama_context = self.llama_proj(llama_emb).unsqueeze(1)
+        moment_context = self.moment_proj(moment_emb).unsqueeze(1)
+
+        # Combine contexts
+        context = torch.cat([llama_context, moment_context], dim=1)
+
+        # Initialize z
+        batch_size = context.size(0)
+        z = self.z_init.expand(batch_size, -1, -1)
+
+        # Recursion
+        with torch.no_grad():
+            for _ in range(self.n_loops - 1):
+                for _ in range(self.n_recursion):
+                    z = self.forward_recursion_step(z, context)
+
+        z = z.detach()
+        for _ in range(self.n_recursion):
+            z = self.forward_recursion_step(z, context)
+
+        # Classification
+        logits = self.classifier(z.squeeze(1))
+        return logits
+
+
+class TRMFusionBTSModel(nn.Module):
+    def __init__(
+        self,
+        llama_model_name: str,
+        moment_model_name: str,
+        n_classes: int,
+        trm_dim: int = 512,
+        n_recursion: int = 6,
+        n_loops: int = 3,
+    ):
+        super().__init__()
+        self.trm_dim = trm_dim
+        self.n_recursion = n_recursion
+        self.n_loops = n_loops
+        self.n_classes = n_classes
+        self.llama_model_name = llama_model_name
+        self.moment_model_name = moment_model_name
+
+        llama_model = init_llama(self.llama_model_name)
+        moment_model = init_moment(self.moment_model_name)
+
+        llama_output_dim = self.llama_model.config.hidden_size
+        moment_output_dim = self.moment_model.config.d_model
+        self.trm_module = TRMModule(
+            n_classes=self.n_classes,
+            llama_output_dim=llama_output_dim,
+            moment_output_dim=moment_output_dim,
+            trm_dim=trm_dim,
+            n_recursion=n_recursion,
+        )
+
+        self.register_buffer("llama_model", llama_model, persistent=False)
+        self.register_buffer("moment_model", moment_model, persistent=False)
 
     def forward_llama(self, llama_inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        assert self.llama_enabled, "Llama model is not enabled."
-        with torch.no_grad():
-            llama_emb = self.llama_model(**llama_inputs).last_hidden_state[:, -1, :]
+        llama_emb = self.llama_model(**llama_inputs).last_hidden_state[:, -1, :]
         return LlamaOutputs(
             last_hidden_state=llama_emb,
         )
 
     def forward_moment(self, timeseries: torch.Tensor) -> torch.Tensor:
-        assert self.moment_enabled, "Moment model is not enabled."
         # timeseries : batchsize, n_channels, context_length
         assert timeseries.size(2) <= 512, "Moment model supports maximum sequence length of 512."
-        # print("device", timeseries.device)
-
         max_seq_len = 512
         pad = max_seq_len - timeseries.size(2)
         if pad > 0:
@@ -183,56 +194,32 @@ class BTSModel(nn.Module):
 
         return MomentOutputs(last_hidden_state=moment_outputs.embeddings)
 
-    def combine_outputs(
-        self,
-        llama_outputs: LlamaOutputs,
-        moment_outputs: MomentOutputs,
-    ) -> torch.Tensor:
-        llama_feat = self.combind_head(llama_outputs, moment_outputs)
-        return llama_feat
+    def forward(self, llama_inputs: Dict[str, torch.Tensor], timeseries: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            llama_outputs = self.forward_llama(llama_inputs)
+            moment_outputs = self.forward_moment(timeseries)
+        logits = self.trm_module(llama_outputs.last_hidden_state, moment_outputs.last_hidden_state)
+        return logits
 
     def save(self, save_directory: str | Path):
         if isinstance(save_directory, str):
             save_directory = Path(save_directory)
         if not save_directory.exists():
             save_directory.mkdir(parents=True, exist_ok=True)
-        torch.save(self.combind_head.state_dict(), save_directory / "combine_head.pth")
-        self.llama_model.save_pretrained(save_directory / "llama_peft_model")
+
+        torch.save(self.trm_module.state_dict(), save_directory / "trm_head.pth")
 
     def load(self, load_directory: str | Path):
         if isinstance(load_directory, str):
             load_directory = Path(load_directory)
         if not load_directory.exists():
             raise ValueError(f"Load directory {load_directory} does not exist.")
-        self.combind_head.load_state_dict(torch.load(load_directory / "combine_head.pth", map_location=self.device))
-        llama_adapter_dir = load_directory / "llama_peft_model"
-        peft_config = PeftConfig.from_pretrained(llama_adapter_dir)
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-        base_llama = LlamaModel.from_pretrained(
-            peft_config.base_model_name_or_path,
-            torch_dtype=torch.bfloat16,
-            quantization_config=bnb_config,
-        )
-        base_llama = prepare_model_for_kbit_training(base_llama)
-        self.llama_model = PeftModel.from_pretrained(
-            base_llama,
-            llama_adapter_dir,
-            is_trainable=False,
-        )
-        self.llama_model.to(self.device)
+        self.trm_module.load_state_dict(torch.load(load_directory / "trm_head.pth", map_location="cpu"))
 
     def print_num_trainable_parameters(self):
-        print("Llama Trainable parameters:")
-        llama_num_unfrozen_parameters = sum(p.numel() for p in self.llama_model.parameters() if p.requires_grad)
-        llama_num_total_parameters = sum(p.numel() for p in self.llama_model.parameters())
-        print(f"Llama Model : {llama_num_unfrozen_parameters} ({llama_num_unfrozen_parameters / llama_num_total_parameters * 100:.2f} % of total)")
-        print()
-        print("Moment Trainable parameters:")
-        moment_num_unfrozen_parameters = sum(p.numel() for p in self.moment_model.parameters() if p.requires_grad)
-        moment_num_total_parameters = sum(p.numel() for p in self.moment_model.parameters())
-        print(f"Moment Model (include head) : {moment_num_unfrozen_parameters} ({moment_num_unfrozen_parameters / moment_num_total_parameters * 100:.2f} % of total)")
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"Total parameters: {total_params}")
+        print(f"Trainable parameters: {trainable_params}")
+        print(f"Non-trainable parameters: {total_params - trainable_params}")
+        print(f"Percentage of trainable parameters: {100 * trainable_params / total_params:.2f}%")

@@ -1,1 +1,1 @@
-from .model import BTSModel
+from .model import TRMFusionBTSModel

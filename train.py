@@ -10,7 +10,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from transformers import get_scheduler, AutoTokenizer
 
 
-from src.model import BTSModel
+from src.model import TRMFusionBTSModel
 from src.dataset import init_dataset, collate_fn
 from src.utils import to_device, set_seed
 
@@ -25,13 +25,13 @@ dataset = sys.argv[1]
 DATASET = dataset  # "manufacturing" or "biosignal"
 
 WANDB_MODE = "online"
-TEST_NAME = f"{DATASET}_ensemble_experiment_flash_attention2"
+TEST_NAME = f"{DATASET}_ensemble_experiment_trm"
 LLAMA_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 MOMENT_MODEL_NAME = "AutonLab/MOMENT-1-large"
 DEVICE = "cuda"
 BATCH_SIZE = 16
 DATALOADER_SHUFFLE = True
-LEARNING_RATE = 1e-6
+LEARNING_RATE = 1e-5
 EPOCHS = 10
 MAX_GRAD_NORM = 5.0
 OUTPUT_DIR = f"./outputs/{TEST_NAME}"
@@ -43,7 +43,14 @@ NUM_CHANNELS = 19 if DATASET == "biosignal" else 24
 task_name = "classification" if DATASET == "biosignal" else "forecasting"
 
 
-def train_model(model, dataloader, optimizer, loss_fn, task_name, scheduler, scaler):
+def train_model(
+    model: TRMFusionBTSModel,
+    dataloader: DataLoader,
+    optimizer,
+    loss_fn,
+    task_name: str,
+    scaler,
+):
     model.train()
     accumulate_losses = 0.0
     accumulate_steps = 0
@@ -51,34 +58,28 @@ def train_model(model, dataloader, optimizer, loss_fn, task_name, scheduler, sca
     for i, batch in enumerate(tqdm(dataloader)):
         batch = to_device(batch, DEVICE)
         with torch.amp.autocast(device_type=DEVICE, dtype=torch.bfloat16):
-            moment_outputs = model.forward_moment(timeseries=batch["x_scaled"])
-            llama_outputs = model.forward_llama(llama_inputs=batch["patch_report_tokenized"])
-            if task_name == "classification":
-                targets = batch["y"].long().squeeze(-1)
-            elif task_name == "forecasting":
-                targets = batch["y_scaled"].float()
-
-            outputs = model.combine_outputs(llama_outputs, moment_outputs)
-            loss = loss_fn(outputs, targets)
+            model_outputs = model(
+                llama_inputs=batch["patch_report_tokenized"],
+                timeseries=batch["x_scaled"],
+            )
+            targets = batch["y"].long().squeeze(-1) if task_name == "classification" else batch["y_scaled"].float()
+            loss = loss_fn(model_outputs, targets)
 
             accumulate_losses += loss
             accumulate_steps += 1
 
         if i % ACCUMULATE_STEPS == 0 or i == len(dataloader) - 1:
             accumulate_losses = accumulate_losses / accumulate_steps
-
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             parameters = [p for p in model.parameters() if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(parameters, MAX_GRAD_NORM)
             scaler.step(optimizer)
-            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             scaler.update()
             wandb.log(
                 {
                     "train/total_loss": accumulate_losses.item(),
-                    "lr": scheduler.get_last_lr()[0],
                 },
             )
             accumulate_losses = 0.0
@@ -86,24 +87,22 @@ def train_model(model, dataloader, optimizer, loss_fn, task_name, scheduler, sca
 
 
 @torch.no_grad()
-def eval_model(model, dataloader, loss_fn, task_name):
+def eval_model(model: TRMFusionBTSModel, dataloader, loss_fn, task_name):
     model.eval()
     total_losses = []
     accuracy_list = []
     for batch in tqdm(dataloader):
         batch = to_device(batch, DEVICE)
         with torch.amp.autocast(device_type=DEVICE, dtype=torch.bfloat16):
-            moment_outputs = model.forward_moment(timeseries=batch["x_scaled"])
-            llama_outputs = model.forward_llama(llama_inputs=batch["patch_report_tokenized"])
-            if task_name == "classification":
-                targets = batch["y"].long().squeeze(-1)
-            elif task_name == "forecasting":
-                targets = batch["y_scaled"].float()
+            model_outputs = model(
+                llama_inputs=batch["patch_report_tokenized"],
+                timeseries=batch["x_scaled"],
+            )
+            targets = batch["y"].long().squeeze(-1) if task_name == "classification" else batch["y_scaled"].float()
 
-            pred = model.combine_outputs(llama_outputs, moment_outputs)
-            loss = loss_fn(pred, targets)
+            loss = loss_fn(model_outputs, targets)
             if task_name == "classification":
-                accuracy = (pred.argmax(dim=-1) == targets).float().mean()
+                accuracy = (model_outputs.argmax(dim=-1) == targets).float().mean()
                 accuracy_list.append(accuracy.item())
         total_losses.append(loss.item())
     wandb.log(
@@ -114,11 +113,10 @@ def eval_model(model, dataloader, loss_fn, task_name):
     )
 
 
-def save(epoch, model: BTSModel, optimizer, scheduler):
+def save(epoch, model: TRMFusionBTSModel, optimizer):
     output_dir = Path(OUTPUT_DIR) / f"epoch_{epoch+1}"
     model.save(output_dir)
     torch.save(optimizer.state_dict(), output_dir / "optimizer.pth")
-    torch.save(scheduler.state_dict(), output_dir / "scheduler.pth")
 
 
 def main():
@@ -163,8 +161,6 @@ def main():
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=DATALOADER_SHUFFLE,
-        # prefetch_factor=3,
-        # num_workers=1,
         pin_memory=True,
         collate_fn=tokenizer_collate_fn,
     )
@@ -172,45 +168,26 @@ def main():
         test_dataset,
         batch_size=BATCH_SIZE,
         shuffle=DATALOADER_SHUFFLE,
-        # prefetch_factor=3,
-        # num_workers=1,
         pin_memory=True,
         collate_fn=tokenizer_collate_fn,
     )
-    model = BTSModel(
+    model = TRMFusionBTSModel(
         llama_model_name=LLAMA_MODEL_NAME,
         moment_model_name=MOMENT_MODEL_NAME,
-        task_name=task_name,
-        device=DEVICE,
-        num_channels=NUM_CHANNELS,
-        moment_reduction_method="concat",
+        n_classes=2 if task_name == "classification" else 1,
     )
     model.to(DEVICE)
     model.print_num_trainable_parameters()
 
-    loss_fn = None
-    if task_name == "classification":
-        loss_fn = nn.CrossEntropyLoss().to(DEVICE)
-    elif task_name == "forecasting":
-        loss_fn = nn.MSELoss().to(DEVICE)
-    else:
-        raise ValueError("Unsupported task name")
-
-    steps_per_epoch = math.ceil(len(train_dataloader) / ACCUMULATE_STEPS)
-    total_steps = steps_per_epoch * EPOCHS
+    loss_fn = nn.CrossEntropyLoss() if task_name == "classification" else nn.MSELoss()
 
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE)
-    max_lr = 1e-5
-    total_steps = math.ceil(len(train_dataloader) / ACCUMULATE_STEPS) * EPOCHS
-    scheduler = OneCycleLR(optimizer, max_lr=max_lr, total_steps=total_steps, pct_start=0.3)
 
-    # scheduler = get_scheduler(
-    #     # name='constant_with_warmup',
-    #     name="linear",
-    #     optimizer=optimizer,
-    #     num_training_steps=total_steps,
-    #     num_warmup_steps=steps_per_epoch,
-    # )
+    # steps_per_epoch = math.ceil(len(train_dataloader) / ACCUMULATE_STEPS)
+    # total_steps = steps_per_epoch * EPOCHS
+    # max_lr = 5e-5
+    # total_steps = math.ceil(len(train_dataloader) / ACCUMULATE_STEPS) * EPOCHS
+    # scheduler = OneCycleLR(optimizer, max_lr=max_lr, total_steps=total_steps, pct_start=0.3)
 
     for epoch in range(EPOCHS):
         wandb.log({"epoch": epoch + 1})
@@ -223,14 +200,12 @@ def main():
             loss_fn=loss_fn,
             task_name=task_name,
             scaler=scaler,
-            scheduler=scheduler,
         )
 
         save(
             epoch,
             model,
             optimizer,
-            scheduler,
         )
 
         eval_model(

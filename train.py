@@ -6,11 +6,10 @@ import wandb
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import OneCycleLR
-from transformers import get_scheduler, AutoTokenizer
+from transformers import AutoTokenizer
+import kornia
 
-
-from src.model import TRMFusionBTSModel
+from src.model import BTSModel
 from src.dataset import init_dataset, collate_fn
 from src.utils import to_device, set_seed
 
@@ -18,7 +17,10 @@ import sys
 
 import warnings
 
+# TODO: Warning을 해결해보아요.
 warnings.filterwarnings("ignore", "None of the inputs have requires_grad=True. Gradients will be None")
+warnings.filterwarnings("ignore", message=".*use_reentrant.*")
+warnings.filterwarnings("ignore", message="X does not have valid feature name")
 
 dataset = sys.argv[1]
 
@@ -26,25 +28,26 @@ DATASET = dataset  # "manufacturing" or "biosignal"
 
 WANDB_MODE = "online"
 TEST_NAME = f"{DATASET}_ensemble_experiment_trm"
-LLAMA_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-MOMENT_MODEL_NAME = "AutonLab/MOMENT-1-large"
+LLAMA_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
+MOMENT_MODEL_NAME = "AutonLab/MOMENT-1-small"
 DEVICE = "cuda"
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 DATALOADER_SHUFFLE = True
-LEARNING_RATE = 1e-5
-EPOCHS = 10
+LEARNING_RATE = 5e-5
+EPOCHS = 20
 MAX_GRAD_NORM = 5.0
 OUTPUT_DIR = f"./outputs/{TEST_NAME}"
 CONTEXT_LENGTH = 12
-STRIDE = 12 if DATASET == "biosignal" else 1
-ACCUMULATE_STEPS = 2
-NUM_CHANNELS = 19 if DATASET == "biosignal" else 24
+# STRIDE = 12 if DATASET == "biosignal" else 1
+STRIDE = 12
+ACCUMULATE_STEPS = 1
+NUM_CHANNELS = 19 if DATASET == "biosignal" else 25
 
 task_name = "classification" if DATASET == "biosignal" else "forecasting"
 
 
 def train_model(
-    model: TRMFusionBTSModel,
+    model: BTSModel,
     dataloader: DataLoader,
     optimizer,
     loss_fn,
@@ -62,7 +65,7 @@ def train_model(
                 llama_inputs=batch["patch_report_tokenized"],
                 timeseries=batch["x_scaled"],
             )
-            targets = batch["y"].long().squeeze(-1) if task_name == "classification" else batch["y_scaled"].float()
+            targets = batch["y"].long() if task_name == "classification" else batch["y_scaled"].float()
             loss = loss_fn(model_outputs, targets)
 
             accumulate_losses += loss
@@ -87,7 +90,7 @@ def train_model(
 
 
 @torch.no_grad()
-def eval_model(model: TRMFusionBTSModel, dataloader, loss_fn, task_name):
+def eval_model(model: BTSModel, dataloader, loss_fn, task_name):
     model.eval()
     total_losses = []
     accuracy_list = []
@@ -98,7 +101,7 @@ def eval_model(model: TRMFusionBTSModel, dataloader, loss_fn, task_name):
                 llama_inputs=batch["patch_report_tokenized"],
                 timeseries=batch["x_scaled"],
             )
-            targets = batch["y"].long().squeeze(-1) if task_name == "classification" else batch["y_scaled"].float()
+            targets = batch["y"].long() if task_name == "classification" else batch["y_scaled"].float()
 
             loss = loss_fn(model_outputs, targets)
             if task_name == "classification":
@@ -113,7 +116,7 @@ def eval_model(model: TRMFusionBTSModel, dataloader, loss_fn, task_name):
     )
 
 
-def save(epoch, model: TRMFusionBTSModel, optimizer):
+def save(epoch, model: BTSModel, optimizer):
     output_dir = Path(OUTPUT_DIR) / f"epoch_{epoch+1}"
     model.save(output_dir)
     torch.save(optimizer.state_dict(), output_dir / "optimizer.pth")
@@ -171,23 +174,21 @@ def main():
         pin_memory=True,
         collate_fn=tokenizer_collate_fn,
     )
-    model = TRMFusionBTSModel(
+    model = BTSModel(
         llama_model_name=LLAMA_MODEL_NAME,
         moment_model_name=MOMENT_MODEL_NAME,
         n_classes=2 if task_name == "classification" else 1,
+        n_channels=NUM_CHANNELS,
+        head_type="mlp",
     )
     model.to(DEVICE)
-    model.print_num_trainable_parameters()
-
-    loss_fn = nn.CrossEntropyLoss() if task_name == "classification" else nn.MSELoss()
+    # model.print_num_trainable_parameters()
+    if task_name == "classification":
+        loss_fn = kornia.losses.FocalLoss(alpha=0.5, gamma=2.0, reduction="mean")
+    else:
+        loss_fn = nn.MSELoss()
 
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE)
-
-    # steps_per_epoch = math.ceil(len(train_dataloader) / ACCUMULATE_STEPS)
-    # total_steps = steps_per_epoch * EPOCHS
-    # max_lr = 5e-5
-    # total_steps = math.ceil(len(train_dataloader) / ACCUMULATE_STEPS) * EPOCHS
-    # scheduler = OneCycleLR(optimizer, max_lr=max_lr, total_steps=total_steps, pct_start=0.3)
 
     for epoch in range(EPOCHS):
         wandb.log({"epoch": epoch + 1})

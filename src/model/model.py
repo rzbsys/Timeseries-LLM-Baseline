@@ -1,25 +1,27 @@
 from typing import Optional, Literal, List, Tuple, Dict
 from dataclasses import dataclass
-
 from pathlib import Path
+
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, BitsAndBytesConfig
-from peft import PeftModel, PeftConfig, get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
+from transformers import BitsAndBytesConfig
+from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 
 from src.model.llama import LlamaModel
 from src.model.moment import MOMENTPipeline
 from src.utils import freeze_parameters
 
+from .head import MLPHead, TRMHead
+
 
 @dataclass
 class LlamaOutputs:
-    last_hidden_state: torch.Tensor = None
+    representation: torch.Tensor = None
 
 
 @dataclass
 class MomentOutputs:
-    last_hidden_state: torch.Tensor = None
+    representation: torch.Tensor = None
 
 
 def init_llama(llama_model_name: str, quantization: bool = False, model_compile: bool = False, init_lora: bool = False) -> LlamaModel:
@@ -36,7 +38,7 @@ def init_llama(llama_model_name: str, quantization: bool = False, model_compile:
         )
         model_config["quantization_config"] = bnb_config
 
-    llama_model = LlamaModel.from_pretrained(llama_model_name, **bnb_config)
+    llama_model = LlamaModel.from_pretrained(llama_model_name, **model_config)
     if model_compile:
         llama_model = torch.compile(llama_model, mode="max-autotune")
     # Lora
@@ -53,12 +55,15 @@ def init_llama(llama_model_name: str, quantization: bool = False, model_compile:
         )
         llama_model = prepare_model_for_kbit_training(llama_model)
         llama_model = get_peft_model(llama_model, peft_config)
+        print("Initialized Llama model with LoRA.")
+        llama_model.print_trainable_parameters()
+
     else:
         freeze_parameters(llama_model)
     return llama_model
 
 
-def init_moment(moment_model_name: str) -> MOMENTPipeline:
+def init_moment(moment_model_name: str, init_lora: bool = False) -> MOMENTPipeline:
     config = {"task_name": "embedding"}
 
     moment_model = MOMENTPipeline.from_pretrained(
@@ -66,112 +71,78 @@ def init_moment(moment_model_name: str) -> MOMENTPipeline:
         model_kwargs=config,
     )
     moment_model.init()
+
+    if init_lora:
+        if hasattr(moment_model, "config") and not hasattr(moment_model.config, "get"):
+
+            def config_get(key, default=None):
+                return getattr(moment_model.config, key, default)
+
+            moment_model.config.get = config_get
+
+        peft_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,  # 또는 SEQ_2_SEQ_LM 등 모델 구조에 맞게 설정 (시계열은 보통 커스텀이므로 None이나 FEATURE_EXTRACTION 권장)
+            inference_mode=False,
+            r=8,  # Rank
+            lora_alpha=32,  # Scaling factor
+            lora_dropout=0.1,
+            target_modules=["q", "v"],  # 위에서 확인한 타겟 모듈 지정
+        )
+        moment_model = get_peft_model(moment_model, peft_config)
+        print("Initialized MOMENT model with LoRA.")
+        moment_model.print_trainable_parameters()
+
     return moment_model
 
 
-class TRMModule(nn.Module):
-    def __init__(
-        self,
-        n_classes: int,
-        llama_output_dim: int,
-        moment_output_dim: int,
-        trm_dim: int = 512,
-        n_recursion: int = 6,
-    ):
-        super().__init__()
-        self.trm_dim = trm_dim
-        self.n_recursion = n_recursion
-        self.n_classes = n_classes
-        self.z_init = nn.Parameter(torch.randn(1, 1, trm_dim))
-
-        self.decoder_layer = nn.TransformerDecoderLayer(
-            d_model=trm_dim,
-            nhead=8,
-            dim_feedforward=2048,
-            dropout=0.1,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )  # Pre-Norm for stability
-        self.llama_proj = nn.Linear(llama_output_dim, trm_dim)
-        self.moment_proj = nn.Linear(moment_output_dim, trm_dim)
-
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(trm_dim),
-            nn.Linear(
-                trm_dim,
-                n_classes,
-            ),
-        )
-
-    def forward_recursion_step(self, z: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        new_z = self.decoder_layer(z, context)
-        return new_z
-
-    def forward(self, llama_emb: torch.Tensor, moment_emb: torch.Tensor) -> torch.Tensor:
-        llama_context = self.llama_proj(llama_emb).unsqueeze(1)
-        moment_context = self.moment_proj(moment_emb).unsqueeze(1)
-
-        # Combine contexts
-        context = torch.cat([llama_context, moment_context], dim=1)
-
-        # Initialize z
-        batch_size = context.size(0)
-        z = self.z_init.expand(batch_size, -1, -1)
-
-        # Recursion
-        with torch.no_grad():
-            for _ in range(self.n_loops - 1):
-                for _ in range(self.n_recursion):
-                    z = self.forward_recursion_step(z, context)
-
-        z = z.detach()
-        for _ in range(self.n_recursion):
-            z = self.forward_recursion_step(z, context)
-
-        # Classification
-        logits = self.classifier(z.squeeze(1))
-        return logits
-
-
-class TRMFusionBTSModel(nn.Module):
+class BTSModel(nn.Module):
     def __init__(
         self,
         llama_model_name: str,
         moment_model_name: str,
         n_classes: int,
-        trm_dim: int = 512,
-        n_recursion: int = 6,
-        n_loops: int = 3,
+        n_channels: int,
+        head_type: Literal["trm", "mlp"],
+        head_configs: Optional[Dict] = {},
+        # trm_dim: int = 512,
+        # n_recursion: int = 6,
+        # n_loops: int = 3,
     ):
         super().__init__()
-        self.trm_dim = trm_dim
-        self.n_recursion = n_recursion
-        self.n_loops = n_loops
+        self.n_channels = n_channels
         self.n_classes = n_classes
         self.llama_model_name = llama_model_name
         self.moment_model_name = moment_model_name
+        self.head_type = head_type
 
-        llama_model = init_llama(self.llama_model_name)
-        moment_model = init_moment(self.moment_model_name)
+        self.llama_model = init_llama(self.llama_model_name, quantization=True, init_lora=True)
+        self.moment_model = init_moment(self.moment_model_name, init_lora=True)
 
         llama_output_dim = self.llama_model.config.hidden_size
-        moment_output_dim = self.moment_model.config.d_model
-        self.trm_module = TRMModule(
-            n_classes=self.n_classes,
-            llama_output_dim=llama_output_dim,
-            moment_output_dim=moment_output_dim,
-            trm_dim=trm_dim,
-            n_recursion=n_recursion,
-        )
+        # concat all channel embeddings
+        moment_output_dim = self.moment_model.config.d_model * n_channels
 
-        self.register_buffer("llama_model", llama_model, persistent=False)
-        self.register_buffer("moment_model", moment_model, persistent=False)
+        if head_type == "trm":
+            self.head = TRMHead(
+                n_classes=self.n_classes,
+                llama_output_dim=llama_output_dim,
+                moment_output_dim=moment_output_dim,
+                **head_configs,
+            )
+        elif head_type == "mlp":
+            self.head = MLPHead(
+                n_classes=self.n_classes,
+                llama_output_dim=llama_output_dim,
+                moment_output_dim=moment_output_dim,
+                **head_configs,
+            )
+        else:
+            raise ValueError(f"Invalid head type: {head_type}")
 
     def forward_llama(self, llama_inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
         llama_emb = self.llama_model(**llama_inputs).last_hidden_state[:, -1, :]
         return LlamaOutputs(
-            last_hidden_state=llama_emb,
+            representation=llama_emb,
         )
 
     def forward_moment(self, timeseries: torch.Tensor) -> torch.Tensor:
@@ -188,17 +159,16 @@ class TRMFusionBTSModel(nn.Module):
 
         moment_outputs = self.moment_model.embed(
             x_enc=timeseries,
-            reduction="mean",
+            reduction="concat",
             input_mask=input_mask,
         )
 
-        return MomentOutputs(last_hidden_state=moment_outputs.embeddings)
+        return MomentOutputs(representation=moment_outputs.embeddings)
 
     def forward(self, llama_inputs: Dict[str, torch.Tensor], timeseries: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            llama_outputs = self.forward_llama(llama_inputs)
-            moment_outputs = self.forward_moment(timeseries)
-        logits = self.trm_module(llama_outputs.last_hidden_state, moment_outputs.last_hidden_state)
+        llama_outputs = self.forward_llama(llama_inputs)
+        moment_outputs = self.forward_moment(timeseries)
+        logits = self.head(llama_outputs.representation, moment_outputs.representation)
         return logits
 
     def save(self, save_directory: str | Path):
@@ -206,20 +176,28 @@ class TRMFusionBTSModel(nn.Module):
             save_directory = Path(save_directory)
         if not save_directory.exists():
             save_directory.mkdir(parents=True, exist_ok=True)
+        torch.save(self.head.state_dict(), save_directory / f"{self.head_type}_head.pth")
 
-        torch.save(self.trm_module.state_dict(), save_directory / "trm_head.pth")
+        if hasattr(self.llama_model, "save_pretrained"):
+            self.llama_model.save_pretrained(save_directory / "llama_model")
+        if hasattr(self.moment_model, "save_pretrained"):
+            self.moment_model.save_pretrained(save_directory / "moment_model")
 
     def load(self, load_directory: str | Path):
         if isinstance(load_directory, str):
             load_directory = Path(load_directory)
         if not load_directory.exists():
             raise ValueError(f"Load directory {load_directory} does not exist.")
-        self.trm_module.load_state_dict(torch.load(load_directory / "trm_head.pth", map_location="cpu"))
+        self.head.load_state_dict(torch.load(load_directory / f"{self.head_type}_head.pth", map_location="cpu"))
+        if hasattr(self.llama_model, "load_pretrained"):
+            self.llama_model = self.llama_model.from_pretrained(load_directory / "llama_model")
+        if hasattr(self.moment_model, "load_pretrained"):
+            self.moment_model = self.moment_model.from_pretrained(load_directory / "moment_model")
 
-    def print_num_trainable_parameters(self):
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"Total parameters: {total_params}")
-        print(f"Trainable parameters: {trainable_params}")
-        print(f"Non-trainable parameters: {total_params - trainable_params}")
-        print(f"Percentage of trainable parameters: {100 * trainable_params / total_params:.2f}%")
+    # def print_num_trainable_parameters(self):
+    #     total_params = sum(p.numel() for p in self.parameters())
+    #     trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+    #     print(f"Total parameters: {total_params}")
+    #     print(f"Trainable parameters: {trainable_params}")
+    #     print(f"Non-trainable parameters: {total_params - trainable_params}")
+    #     print(f"Percentage of trainable parameters: {100 * trainable_params / total_params:.2f}%")

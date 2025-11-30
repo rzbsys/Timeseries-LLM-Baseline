@@ -94,7 +94,7 @@ def main():
         moment_reduction_method="concat",
     )
     model.to(DEVICE)
-    model.print_num_trainable_parameters()
+    # model.print_num_trainable_parameters()
     model.load(CHECKPOINT_PATH)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 

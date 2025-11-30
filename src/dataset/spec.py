@@ -107,7 +107,7 @@ BIOSIGNAL_DEFAULT_PREPROCESS_FNS = []
 
 
 def validate_same_sub(patch: pd.DataFrame) -> bool:
-    patch_subs = patch["sub_id"].unique()
+    patch_subs = patch["trial"].unique()
     return len(patch_subs) == 1
 
 

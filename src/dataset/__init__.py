@@ -3,7 +3,7 @@ from tqdm import tqdm
 
 import torch
 
-from .dataset import BTSTimeSeriesDataset, DatasetConfig, ConcatDataets, collate_fn
+from .dataset import BTSTimeSeriesDataset, DatasetConfig, collate_fn
 from .spec import *
 
 
@@ -45,37 +45,27 @@ def init_dataset(
         )
         dataset = BTSTimeSeriesDataset(config=dataset_config)
     elif dataset_name == "biosignal":
-        dataset_pathes = list(Path(BIOSIGNAL_DATASET).glob("*"))
-        dataset_pathes = [path for path in dataset_pathes if "sub1_" in path.name]
-
-        datasets = []
-
-        for dataset_path in tqdm(dataset_pathes):
-            dataset_config = DatasetConfig(
-                dataset_path=dataset_path,
-                column_to_train=BIOSIGNAL_DEFAULT_TRAIN_COLUMNS,
-                column_to_predict=BIOSIGNAL_DEFAULT_TARGET_COLUMNS,
-                preprocess_fns=BIOSIGNAL_DEFAULT_PREPROCESS_FNS,
-                mode=split,
-                context_length=context_length,
-                stride=stride,
-                x_standardization=True,
-                y_standardization=True,
-                patch_validate_fns=BIOSIGNAL_DEFAULT_PATCH_VALIDATE_FNS,
-                # skip_validate=True,
-                verbose=False,
-                shuffle=True,
-                patch_report_fn=BIOSIGNAL_DEFAULT_REPORT_FN,
-                train_ratio=0.8,
-                val_ratio=0.0,
-                test_ratio=0.2,
-                random_sigma=random_sigma,
-            )
-
-            ds = BTSTimeSeriesDataset(config=dataset_config)
-            datasets.append(ds)
-
-        dataset = ConcatDataets(datasets)
+        dataset_config = DatasetConfig(
+            dataset_path=BIOSIGNAL_DATASET,
+            column_to_train=BIOSIGNAL_DEFAULT_TRAIN_COLUMNS,
+            column_to_predict=BIOSIGNAL_DEFAULT_TARGET_COLUMNS,
+            preprocess_fns=BIOSIGNAL_DEFAULT_PREPROCESS_FNS,
+            mode=split,
+            context_length=context_length,
+            stride=stride,
+            x_standardization=True,
+            y_standardization=True,
+            patch_validate_fns=BIOSIGNAL_DEFAULT_PATCH_VALIDATE_FNS,
+            verbose=False,
+            shuffle=True,
+            patch_report_fn=BIOSIGNAL_DEFAULT_REPORT_FN,
+            train_ratio=0.8,
+            val_ratio=0.0,
+            test_ratio=0.2,
+            seed=42,
+            random_sigma=random_sigma,
+        )
+        dataset = BTSTimeSeriesDataset(config=dataset_config)
     else:
         raise ValueError("Invalid dataset_name value. Choose 'manufacturing' or 'biosignal'.")
 

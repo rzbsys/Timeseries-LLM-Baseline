@@ -31,11 +31,9 @@ def split_data(data: pd.DataFrame, train_ratio: float, val_ratio: float, test_ra
     return train_data, val_data, test_data
 
 
-def standardize_data(data: pd.DataFrame, target_to_fit: pd.DataFrame, vars) -> pd.DataFrame:
-    scaler = StandardScaler().fit(target_to_fit)
-    data_copy = data.copy()
-    data_copy.loc[:, vars] = scaler.transform(data[vars].values)
-    return data_copy, scaler
+def standardize_data(data: pd.DataFrame) -> pd.DataFrame:
+    scaler = StandardScaler().fit(data)
+    return scaler
 
 
 def calc_valid_indices(

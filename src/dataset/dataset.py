@@ -110,16 +110,12 @@ class BTSTimeSeriesDataset(Dataset):
         # 데이터 분할 및 표준화 부분
         train_index = [idx for indices in train_data for idx in indices]
         if self.config.x_standardization:
-            # 우선 train data에 fit 시켜야해서 분할 먼저
-            column_to_train_wo_target = [col for col in self.config.column_to_train if col != self.config.column_to_predict]
-            train_x = preprocess_data.iloc[train_index][column_to_train_wo_target].values
-            preprocess_data, scaler_x = standardize_data(preprocess_data, train_x, column_to_train_wo_target)
-            self.scaler_x = scaler_x
+            train_x = preprocess_data.iloc[train_index][self.config.column_to_train].copy()
+            self.scaler_x = standardize_data(train_x)
 
         if self.config.y_standardization:
-            train_y = preprocess_data.iloc[train_index][[self.config.column_to_predict]].values
-            preprocess_data, scaler_y = standardize_data(preprocess_data, train_y, [self.config.column_to_predict])
-            self.scaler_y = scaler_y
+            train_y = preprocess_data.iloc[train_index][[self.config.column_to_predict]].copy()
+            self.scaler_y = standardize_data(train_y)
 
         if self.config.x_standardization or self.config.y_standardization:
             cols = set([*self.config.column_to_train, self.config.column_to_predict])
@@ -142,33 +138,35 @@ class BTSTimeSeriesDataset(Dataset):
         y_max = y_min + self.config.y_horizon
 
         y_indicates = list(range(y_min, y_max))
-
         x = torch.tensor(self.dataset.iloc[x_indicates][self.config.column_to_train].values).T.float()
-        y = torch.tensor(self.dataset.iloc[y_indicates][self.config.column_to_predict].values).T.float()
-
-        if self.config.random_sigma > 0.0:
-            random_noise = torch.randn_like(x) * self.config.random_sigma
-            x += random_noise
-
+        y = torch.tensor(self.dataset.iloc[y_indicates][[self.config.column_to_predict]].values).T.float()
         output = {"x": x, "y": y, "x_columns": self.config.column_to_train, "y_column": self.config.column_to_predict}
+
+        # 노이즈 추가 부분
+        if self.config.random_sigma > 0.0:
+            output["x"] = output["x"] + torch.randn_like(output["x"]) * self.config.random_sigma
+
+        if self.config.x_standardization:
+            x_numpy = output["x"].T.numpy()
+            x_scaled = self.scaler_x.transform(x_numpy)
+            output["x_scaled"] = torch.tensor(x_scaled.T).float()
+
+        if self.config.y_standardization:
+            y_numpy = output["y"].numpy()
+            y_scaled = self.scaler_y.transform(y_numpy)
+            output["y_scaled"] = torch.tensor(y_scaled.T).float()
 
         patch_report = None
         if self.config.patch_report_fn is not None:
-            sliced_data = self.dataset.iloc[x_indicates].copy()
-            if self.config.random_sigma > 0.0:
-                sliced_data = torch.tensor(sliced_data[self.config.column_to_train].values).T.float() + random_noise
-                sliced_data = pd.DataFrame(sliced_data.T.numpy(), columns=self.config.column_to_train)
+            sliced_data = output["x"].T.numpy()
+            sliced_data = pd.DataFrame(sliced_data, columns=self.config.column_to_train)
             patch_report = self.config.patch_report_fn(sliced_data)
             output["patch_report"] = patch_report
-        if self.config.x_standardization:
-            x_s = torch.tensor(self.scaled_dataset.iloc[x_indicates][self.config.column_to_train].values).T.float()
-            if self.config.random_sigma > 0.0:
-                x_s += random_noise
-            output["x_scaled"] = x_s
-        if self.config.y_standardization:
-            y_s = torch.tensor(self.scaled_dataset.iloc[y_indicates][self.config.column_to_predict].values).T.float()
 
-            output["y_scaled"] = y_s
+        # squeeze y if horizon is 1
+        output["y"] = output["y"].squeeze(0)
+        output["y_scaled"] = output["y_scaled"].squeeze(0)
+
         return output
 
     def __len__(self) -> int:
@@ -201,17 +199,17 @@ def collate_fn(tokenizer, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, tor
     return collated
 
 
-class ConcatDataets(Dataset):
-    def __init__(self, datasets: List[Dataset]):
-        self.datasets = datasets
-        self.dataset_sizes = [len(ds) for ds in datasets]
+# class ConcatDataets(Dataset):
+#     def __init__(self, datasets: List[Dataset]):
+#         self.datasets = datasets
+#         self.dataset_sizes = [len(ds) for ds in datasets]
 
-    def __len__(self) -> int:
-        return sum(self.dataset_sizes)
+#     def __len__(self) -> int:
+#         return sum(self.dataset_sizes)
 
-    def __getitem__(self, idx: int) -> Any:
-        for ds_idx, size in enumerate(self.dataset_sizes):
-            if idx < size:
-                return self.datasets[ds_idx][idx]
-            idx -= size
-        raise IndexError("Index out of range")
+#     def __getitem__(self, idx: int) -> Any:
+#         for ds_idx, size in enumerate(self.dataset_sizes):
+#             if idx < size:
+#                 return self.datasets[ds_idx][idx]
+#             idx -= size
+#         raise IndexError("Index out of range")
